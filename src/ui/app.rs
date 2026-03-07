@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, io,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::Context;
@@ -233,6 +233,10 @@ struct App {
     readonly: bool,
     theme: UiTheme,
     color_support: ColorSupport,
+    pulse_snapshot: Option<PulseSnapshot>,
+    pulse_last_change_at: Instant,
+    pulse_last_revision: u64,
+    pulse_last_revision_at: Instant,
     show_help: bool,
     detail_page_step: u16,
     pending_detail_g: bool,
@@ -263,6 +267,18 @@ struct NodeCapacityTotals {
     pod_alloc: u64,
 }
 
+#[derive(Debug, Clone)]
+struct PulseSnapshot {
+    context: String,
+    namespace: Option<String>,
+    cluster_cpu_req_m: u64,
+    cluster_mem_req_b: u64,
+    cluster_pods: u64,
+    running: usize,
+    pending: usize,
+    failed: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CachedPodTotals {
     totals: PodResourceTotals,
@@ -279,6 +295,7 @@ const LOG_MAX_LINES: usize = 5_000;
 const LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
 const LOG_DEFAULT_TAIL_LINES: i64 = 2_000;
 const LOG_MAX_EVENTS_PER_DRAIN: usize = 1_024;
+const PULSE_TAG_WIDTH: usize = 8;
 
 #[derive(Clone, Copy)]
 struct UiTheme {
@@ -1429,6 +1446,7 @@ impl App {
             .position(|tab| tab.context == initial_context)
             .unwrap_or(0);
         let color_support = detect_color_support();
+        let now = Instant::now();
 
         Self {
             store: StateStore::default(),
@@ -1452,6 +1470,10 @@ impl App {
             readonly,
             theme: ui_theme_for(color_support),
             color_support,
+            pulse_snapshot: None,
+            pulse_last_change_at: now,
+            pulse_last_revision: 0,
+            pulse_last_revision_at: now,
             show_help,
             detail_page_step: 10,
             pending_detail_g: false,
@@ -2882,12 +2904,20 @@ impl App {
         } else {
             "cluster"
         };
+        let now_instant = Instant::now();
+        let revision = self.store.revision();
+        let rev_delta = revision.saturating_sub(self.pulse_last_revision);
+        if rev_delta > 0 {
+            self.pulse_last_revision = revision;
+            self.pulse_last_revision_at = now_instant;
+        }
+        let stale_secs = self.pulse_last_revision_at.elapsed().as_secs();
         let now = Local::now().format("%Y-%m-%d %H:%M:%S");
         let selected_human = if visible_rows == 0 { 0 } else { selected + 1 };
-        let hb = heartbeat_icon();
+        let hb = activity_icon(revision);
         let ctx_short = compact_context_name(&active.context);
         let mut top_line = format!(
-            "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [CLR] {}  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
+            "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [CLR] {}  [REV] +{}  [STALE] {}s  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
             hb,
             now,
             ctx_short,
@@ -2898,6 +2928,8 @@ impl App {
             pane_label,
             pane_icon(active.pane),
             color_support_label(self.color_support),
+            rev_delta,
+            stale_secs,
             visible_rows,
             visible_rows,
             self.store.entity_count(),
@@ -2932,7 +2964,7 @@ impl App {
             ));
         }
 
-        let (running, pending, failed, other) = self.pod_phase_counts_for_tab(&active);
+        let (running, pending, failed, _other) = self.pod_phase_counts_for_tab(&active);
         let scope_pods = self.pod_resource_totals(&active.context, active.namespace.as_deref());
         let cluster_pods = self.pod_resource_totals(&active.context, None);
         let node_caps = self.node_capacity_totals(&active.context);
@@ -2940,78 +2972,262 @@ impl App {
         let mem_pct = percent(cluster_pods.mem_request_b, node_caps.mem_alloc_b);
         let pod_pct = percent(cluster_pods.pods as u64, node_caps.pod_alloc);
         let deployments = self.count_kind_for_tab(&active, ResourceKind::Deployments);
+        let replicasets = self.count_kind_for_tab(&active, ResourceKind::ReplicaSets);
         let statefulsets = self.count_kind_for_tab(&active, ResourceKind::StatefulSets);
         let daemonsets = self.count_kind_for_tab(&active, ResourceKind::DaemonSets);
         let services = self.count_kind_for_tab(&active, ResourceKind::Services);
         let ingresses = self.count_kind_for_tab(&active, ResourceKind::Ingresses);
         let jobs = self.count_kind_for_tab(&active, ResourceKind::Jobs);
         let cronjobs = self.count_kind_for_tab(&active, ResourceKind::CronJobs);
+        let pods = self.count_kind_for_tab(&active, ResourceKind::Pods);
 
         let scope_label = active.namespace.as_deref().unwrap_or("all namespaces");
-        let watch_health = if self.store.error_for_context(&active.context).is_some() {
+        let watch_error = self.store.error_for_context(&active.context);
+        let watch_health = if watch_error.is_some() {
             "[XX]"
         } else {
             "[OK]"
         };
         let pod_health = health_icon(failed, pending);
-        let mut pulse_sections = vec![
-            format!(
-                "[SYS] {}  [WATCH] {}  [POD] {}  [LOG] {}  Context:{} ({}/{})  Scope:{}",
-                hb,
-                watch_health,
-                pod_health,
-                logs_state_icon(&self.logs),
-                ctx_short,
-                self.active_tab + 1,
-                self.tabs.len(),
-                scope_label
+        // 2 columns removed for borders + 2 columns for left/right block padding.
+        let pulse_width = frame.area().width.saturating_sub(4).max(1);
+        let pulse_cols = 3usize;
+        let pulse_gaps = 2usize * pulse_cols.saturating_sub(1);
+        let pulse_body_chars = pulse_width.saturating_sub(PULSE_TAG_WIDTH as u16 + 1) as usize;
+        let pulse_col_width = pulse_body_chars
+            .saturating_sub(pulse_gaps)
+            .checked_div(pulse_cols)
+            .unwrap_or(0)
+            .max(8);
+        let cpu_meter = ascii_meter(cluster_pods.cpu_request_m, node_caps.cpu_alloc_m, 12);
+        let mem_meter = ascii_meter(cluster_pods.mem_request_b, node_caps.mem_alloc_b, 12);
+        let pod_meter = ascii_meter(cluster_pods.pods as u64, node_caps.pod_alloc, 12);
+
+        let current_snapshot = PulseSnapshot {
+            context: active.context.clone(),
+            namespace: active.namespace.clone(),
+            cluster_cpu_req_m: cluster_pods.cpu_request_m,
+            cluster_mem_req_b: cluster_pods.mem_request_b,
+            cluster_pods: cluster_pods.pods as u64,
+            running,
+            pending,
+            failed,
+        };
+        let previous_snapshot = self
+            .pulse_snapshot
+            .as_ref()
+            .filter(|prev| {
+                prev.context == current_snapshot.context
+                    && prev.namespace == current_snapshot.namespace
+            })
+            .cloned();
+
+        let cpu_delta_m = previous_snapshot
+            .as_ref()
+            .map(|prev| value_delta(current_snapshot.cluster_cpu_req_m, prev.cluster_cpu_req_m))
+            .unwrap_or(0);
+        let mem_delta_b = previous_snapshot
+            .as_ref()
+            .map(|prev| value_delta(current_snapshot.cluster_mem_req_b, prev.cluster_mem_req_b))
+            .unwrap_or(0);
+        let pods_delta = previous_snapshot
+            .as_ref()
+            .map(|prev| value_delta(current_snapshot.cluster_pods, prev.cluster_pods))
+            .unwrap_or(0);
+        let run_delta = previous_snapshot
+            .as_ref()
+            .map(|prev| current_snapshot.running as i64 - prev.running as i64)
+            .unwrap_or(0);
+        let pend_delta = previous_snapshot
+            .as_ref()
+            .map(|prev| current_snapshot.pending as i64 - prev.pending as i64)
+            .unwrap_or(0);
+        let fail_delta = previous_snapshot
+            .as_ref()
+            .map(|prev| current_snapshot.failed as i64 - prev.failed as i64)
+            .unwrap_or(0);
+
+        let any_metric_delta = cpu_delta_m != 0
+            || mem_delta_b != 0
+            || pods_delta != 0
+            || run_delta != 0
+            || pend_delta != 0
+            || fail_delta != 0;
+        if any_metric_delta {
+            self.pulse_last_change_at = now_instant;
+        }
+        self.pulse_snapshot = Some(current_snapshot);
+        let metric_stale_secs = self.pulse_last_change_at.elapsed().as_secs();
+
+        let cpu_ratio = ratio_percent_value(cluster_pods.cpu_request_m, node_caps.cpu_alloc_m);
+        let mem_ratio = ratio_percent_value(cluster_pods.mem_request_b, node_caps.mem_alloc_b);
+        let live_severity = if watch_error.is_some() {
+            Severity::Err
+        } else if stale_secs > 60 {
+            Severity::Warn
+        } else {
+            Severity::Ok
+        };
+        let cpu_severity = match cpu_ratio {
+            Some(pct) if pct >= 95.0 => Severity::Err,
+            Some(pct) if pct >= 80.0 => Severity::Warn,
+            _ => Severity::Ok,
+        };
+        let mem_severity = match mem_ratio {
+            Some(pct) if pct >= 95.0 => Severity::Err,
+            Some(pct) if pct >= 80.0 => Severity::Warn,
+            _ => Severity::Ok,
+        };
+        let pod_severity = if failed > 0 {
+            Severity::Err
+        } else if pending > 0 {
+            Severity::Warn
+        } else {
+            Severity::Ok
+        };
+
+        let mut pulse_rows: Vec<(String, Vec<String>, Severity)> = vec![
+            (
+                "[LIVE]".to_string(),
+                vec![
+                    format!("rev +{rev_delta}  metric-delta:{}s", metric_stale_secs),
+                    format!(
+                        "watch {watch_health}  log {}  pod {pod_health}",
+                        logs_state_icon(&self.logs)
+                    ),
+                    format!("state-age {}s  act {}", stale_secs, hb),
+                ],
+                live_severity,
             ),
-            format!(
-                "[CLUSTER] CPU req/alloc {}/{} ({})  MEM req/alloc {}/{} ({})  PODS {}/{} ({})",
-                format_millicpu(cluster_pods.cpu_request_m),
-                format_millicpu(node_caps.cpu_alloc_m),
-                cpu_pct,
-                format_bytes(cluster_pods.mem_request_b),
-                format_bytes(node_caps.mem_alloc_b),
-                mem_pct,
-                cluster_pods.pods,
-                node_caps.pod_alloc,
-                pod_pct
+            (
+                "[SCOPE]".to_string(),
+                vec![
+                    format!(
+                        "ctx {} ({}/{})",
+                        ctx_short,
+                        self.active_tab + 1,
+                        self.tabs.len()
+                    ),
+                    format!("scope {}", scope_label),
+                    format!(
+                        "kind {} pane {} clr {}",
+                        active.kind().short_name(),
+                        pane_icon(active.pane),
+                        color_support_label(self.color_support)
+                    ),
+                ],
+                Severity::Ok,
             ),
-            format!(
-                "[SCOPE] CPU req/lim {}/{}  MEM req/lim {}/{}",
-                format_millicpu(scope_pods.cpu_request_m),
-                format_millicpu(scope_pods.cpu_limit_m),
-                format_bytes(scope_pods.mem_request_b),
-                format_bytes(scope_pods.mem_limit_b),
+            (
+                "[CPU]".to_string(),
+                vec![
+                    format!("cluster {cpu_meter}"),
+                    format!(
+                        "req/alloc {} / {}",
+                        format_millicpu(cluster_pods.cpu_request_m),
+                        format_millicpu(node_caps.cpu_alloc_m)
+                    ),
+                    format!(
+                        "delta {}  scope {} / {}",
+                        format_signed_millicpu(cpu_delta_m),
+                        format_millicpu(scope_pods.cpu_request_m),
+                        format_millicpu(scope_pods.cpu_limit_m)
+                    ),
+                ],
+                cpu_severity,
             ),
-            format!(
-                "[HEALTH] Pods run:{} pend:{} fail:{} other:{}  Nodes ready:{}/{} unsched:{}",
-                running,
-                pending,
-                failed,
-                other,
-                node_caps.nodes_ready,
-                node_caps.nodes_total,
-                node_caps.nodes_unschedulable
+            (
+                "[MEM]".to_string(),
+                vec![
+                    format!("cluster {mem_meter}"),
+                    format!(
+                        "req/alloc {} / {}",
+                        format_bytes(cluster_pods.mem_request_b),
+                        format_bytes(node_caps.mem_alloc_b)
+                    ),
+                    format!(
+                        "delta {}  scope {} / {}",
+                        format_signed_bytes(mem_delta_b),
+                        format_bytes(scope_pods.mem_request_b),
+                        format_bytes(scope_pods.mem_limit_b)
+                    ),
+                ],
+                mem_severity,
             ),
-            format!(
-                "[WORKLOADS] dp:{}  sts:{}  ds:{}  svc:{}  ing:{}  job:{}  cj:{}",
-                deployments, statefulsets, daemonsets, services, ingresses, jobs, cronjobs
+            (
+                "[PODS]".to_string(),
+                vec![
+                    format!("cluster {pod_meter}"),
+                    format!(
+                        "run {}({}) pend {}({}) fail {}({})",
+                        running,
+                        format_signed_count(run_delta),
+                        pending,
+                        format_signed_count(pend_delta),
+                        failed,
+                        format_signed_count(fail_delta)
+                    ),
+                    format!(
+                        "delta {}  nodes {}/{} uns {}",
+                        format_signed_count(pods_delta),
+                        node_caps.nodes_ready,
+                        node_caps.nodes_total,
+                        node_caps.nodes_unschedulable
+                    ),
+                ],
+                pod_severity,
+            ),
+            (
+                "[WORK]".to_string(),
+                vec![
+                    format!("po {pods} dp {deployments} rs {replicasets}"),
+                    format!("sts {statefulsets} ds {daemonsets}"),
+                    format!("svc {services} ing {ingresses} job {jobs} cj {cronjobs}"),
+                ],
+                Severity::Ok,
+            ),
+            (
+                "[UTIL]".to_string(),
+                vec![
+                    format!("cluster cpu {cpu_pct}"),
+                    format!("cluster mem {mem_pct}"),
+                    format!("cluster pods {pod_pct}"),
+                ],
+                Severity::Ok,
             ),
         ];
-        if let Some(err) = self.store.error_for_context(&active.context) {
-            pulse_sections.push(format!("[ALERT] API/watch error: {}", err));
+        if let Some(err) = watch_error {
+            pulse_rows.push((
+                "[ALERT]".to_string(),
+                vec![
+                    "api/watch error".to_string(),
+                    err.to_string(),
+                    "verify RBAC and selected context".to_string(),
+                ],
+                Severity::Err,
+            ));
         }
-        let pulse_text = pulse_sections.join("\n");
+        let pulse_rows_rendered: Vec<(String, String, Severity)> = pulse_rows
+            .iter()
+            .map(|(tag, cells, sev)| {
+                (
+                    fixed_width_cell(tag, PULSE_TAG_WIDTH),
+                    format_pulse_cells(cells, pulse_cols, pulse_col_width),
+                    *sev,
+                )
+            })
+            .collect();
+        let pulse_text = pulse_rows_rendered
+            .iter()
+            .map(|(tag, body, _)| format!("{tag} {body}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let help_text = "ctrl+c quit | : command | / ? filter/search | n/N next/prev | gg/G top/bottom | ctrl+d/u half-page | [ ] history | - repeat | ctrl+a aliases | tab switch-ctx | j/k move/scroll | left/right h-scroll (wrap off) | w wrap toggle | d describe | l logs(stream) | s tail on/off | p pause/resume logs | S sources | L latest | c container picker | ctrl+d delete(table) | ctrl+k kill";
         let help_height = if self.show_help {
             max_vertical_scroll_for_text(help_text, frame.area().width.max(1), 1, true) + 1
         } else {
             0
         };
-        // 2 columns removed for borders + 2 columns for left/right block padding.
-        let pulse_width = frame.area().width.saturating_sub(4).max(1);
         let pulse_lines = max_vertical_scroll_for_text(&pulse_text, pulse_width, 1, true) + 1;
         let pulse_min_height = 3;
         let content_min_height = 6;
@@ -3045,11 +3261,20 @@ impl App {
         let top_status = Paragraph::new(Line::from(top_line)).style(theme.header);
         frame.render_widget(top_status, chunks[0]);
 
-        let pulse_widget = Paragraph::new(pulse_text)
+        let pulse_lines: Vec<Line<'_>> = pulse_rows_rendered
+            .iter()
+            .map(|(tag, body, sev)| {
+                Line::from(vec![
+                    Span::styled(format!("{tag} "), theme.table_header),
+                    Span::styled(body.clone(), severity_style(&theme, *sev)),
+                ])
+            })
+            .collect();
+        let pulse_widget = Paragraph::new(Text::from(pulse_lines))
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("[PULSE] Resource Pulse")
+                    .title("[PULSE] Cluster Pulse")
                     .padding(Padding::new(1, 1, 0, 0)),
             )
             .wrap(Wrap { trim: false })
@@ -3326,7 +3551,12 @@ impl App {
                         detail_scroll,
                         total_lines,
                     );
-                    let mut paragraph = Paragraph::new(highlighted_text(&body, search_query))
+                    let detail_text = if active.pane == Pane::Describe {
+                        highlighted_json_text(&body, search_query, self.color_support)
+                    } else {
+                        highlighted_text(&body, search_query)
+                    };
+                    let mut paragraph = Paragraph::new(detail_text)
                         .block(Block::default().borders(Borders::ALL).title(title))
                         .scroll((detail_scroll, detail_hscroll))
                         .style(theme.block);
@@ -4071,6 +4301,239 @@ fn highlighted_text(text: &str, query: &str) -> Text<'static> {
     Text::from(out)
 }
 
+#[derive(Clone, Copy)]
+enum JsonTokenKind {
+    Key,
+    String,
+    Number,
+    Bool,
+    Null,
+    Punct,
+    Plain,
+}
+
+fn json_token_style(kind: JsonTokenKind, support: ColorSupport) -> Style {
+    match support {
+        ColorSupport::NoColor => match kind {
+            JsonTokenKind::Key => Style::default().add_modifier(Modifier::BOLD),
+            _ => Style::default(),
+        },
+        ColorSupport::Basic => match kind {
+            JsonTokenKind::Key => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            JsonTokenKind::String => Style::default().fg(Color::Green),
+            JsonTokenKind::Number => Style::default().fg(Color::Magenta),
+            JsonTokenKind::Bool | JsonTokenKind::Null => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            JsonTokenKind::Punct => Style::default().fg(Color::DarkGray),
+            JsonTokenKind::Plain => Style::default(),
+        },
+        ColorSupport::Ansi256 | ColorSupport::TrueColor => match kind {
+            JsonTokenKind::Key => Style::default()
+                .fg(Color::Indexed(117))
+                .add_modifier(Modifier::BOLD),
+            JsonTokenKind::String => Style::default().fg(Color::Indexed(114)),
+            JsonTokenKind::Number => Style::default().fg(Color::Indexed(213)),
+            JsonTokenKind::Bool => Style::default()
+                .fg(Color::Indexed(220))
+                .add_modifier(Modifier::BOLD),
+            JsonTokenKind::Null => Style::default().fg(Color::Indexed(180)),
+            JsonTokenKind::Punct => Style::default().fg(Color::Indexed(245)),
+            JsonTokenKind::Plain => Style::default(),
+        },
+    }
+}
+
+fn push_query_highlighted_span(
+    out: &mut Vec<Span<'static>>,
+    text: &str,
+    base_style: Style,
+    needle: &str,
+) {
+    if needle.is_empty() {
+        out.push(Span::styled(text.to_string(), base_style));
+        return;
+    }
+
+    let lower = text.to_ascii_lowercase();
+    let mut cursor = 0usize;
+    while let Some(found) = lower[cursor..].find(needle) {
+        let start = cursor + found;
+        let end = start + needle.len();
+        if start > cursor {
+            out.push(Span::styled(text[cursor..start].to_string(), base_style));
+        }
+        out.push(Span::styled(
+            text[start..end].to_string(),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        out.push(Span::styled(text[cursor..].to_string(), base_style));
+    }
+}
+
+fn is_json_literal_boundary(line: &str, index: usize) -> bool {
+    line.get(index..)
+        .and_then(|rest| rest.chars().next())
+        .map(|ch| !ch.is_ascii_alphanumeric() && ch != '_')
+        .unwrap_or(true)
+}
+
+fn json_spans_for_line(line: &str, support: ColorSupport) -> Vec<(String, Style)> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < line.len() {
+        let Some(ch) = line[idx..].chars().next() else {
+            break;
+        };
+        if ch == '"' {
+            let start = idx;
+            idx = idx.saturating_add(ch.len_utf8());
+            let mut escaped = false;
+            while idx < line.len() {
+                let Some(c) = line[idx..].chars().next() else {
+                    break;
+                };
+                if escaped {
+                    escaped = false;
+                    idx = idx.saturating_add(c.len_utf8());
+                    continue;
+                }
+                if c == '\\' {
+                    escaped = true;
+                    idx = idx.saturating_add(c.len_utf8());
+                    continue;
+                }
+                if c == '"' {
+                    idx = idx.saturating_add(c.len_utf8());
+                    break;
+                }
+                idx = idx.saturating_add(c.len_utf8());
+            }
+            let token = line.get(start..idx).unwrap_or("").to_string();
+            let mut probe = idx;
+            while probe < line.len() {
+                let Some(ws) = line[probe..].chars().next() else {
+                    break;
+                };
+                if ws.is_whitespace() {
+                    probe = probe.saturating_add(ws.len_utf8());
+                } else {
+                    break;
+                }
+            }
+            let kind = if line[probe..].starts_with(':') {
+                JsonTokenKind::Key
+            } else {
+                JsonTokenKind::String
+            };
+            out.push((token, json_token_style(kind, support)));
+            continue;
+        }
+
+        if ch == '-' || ch.is_ascii_digit() {
+            let start = idx;
+            idx = idx.saturating_add(ch.len_utf8());
+            while idx < line.len() {
+                let Some(c) = line[idx..].chars().next() else {
+                    break;
+                };
+                if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-' {
+                    idx = idx.saturating_add(c.len_utf8());
+                } else {
+                    break;
+                }
+            }
+            out.push((
+                line.get(start..idx).unwrap_or("").to_string(),
+                json_token_style(JsonTokenKind::Number, support),
+            ));
+            continue;
+        }
+
+        if line[idx..].starts_with("true") && is_json_literal_boundary(line, idx + 4) {
+            out.push((
+                "true".to_string(),
+                json_token_style(JsonTokenKind::Bool, support),
+            ));
+            idx += 4;
+            continue;
+        }
+        if line[idx..].starts_with("false") && is_json_literal_boundary(line, idx + 5) {
+            out.push((
+                "false".to_string(),
+                json_token_style(JsonTokenKind::Bool, support),
+            ));
+            idx += 5;
+            continue;
+        }
+        if line[idx..].starts_with("null") && is_json_literal_boundary(line, idx + 4) {
+            out.push((
+                "null".to_string(),
+                json_token_style(JsonTokenKind::Null, support),
+            ));
+            idx += 4;
+            continue;
+        }
+
+        if matches!(ch, '{' | '}' | '[' | ']' | ':' | ',') {
+            out.push((
+                ch.to_string(),
+                json_token_style(JsonTokenKind::Punct, support),
+            ));
+            idx = idx.saturating_add(ch.len_utf8());
+            continue;
+        }
+
+        let start = idx;
+        idx = idx.saturating_add(ch.len_utf8());
+        while idx < line.len() {
+            let Some(c) = line[idx..].chars().next() else {
+                break;
+            };
+            if c == '"'
+                || c == '-'
+                || c.is_ascii_digit()
+                || matches!(c, '{' | '}' | '[' | ']' | ':' | ',')
+                || line[idx..].starts_with("true")
+                || line[idx..].starts_with("false")
+                || line[idx..].starts_with("null")
+            {
+                break;
+            }
+            idx = idx.saturating_add(c.len_utf8());
+        }
+        out.push((
+            line.get(start..idx).unwrap_or("").to_string(),
+            json_token_style(JsonTokenKind::Plain, support),
+        ));
+    }
+    out
+}
+
+fn highlighted_json_text(text: &str, query: &str, support: ColorSupport) -> Text<'static> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut spans = Vec::new();
+        for (segment, style) in json_spans_for_line(line, support) {
+            push_query_highlighted_span(&mut spans, &segment, style, &needle);
+        }
+        if spans.is_empty() {
+            spans.push(Span::raw(String::new()));
+        }
+        out.push(Line::from(spans));
+    }
+    Text::from(out)
+}
+
 fn detail_viewer_title(
     pane_title: &str,
     wrap: bool,
@@ -4109,14 +4572,100 @@ fn detail_viewer_title(
     )
 }
 
-fn heartbeat_icon() -> &'static str {
-    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
-    let frame = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        / 250;
-    FRAMES[(frame % FRAMES.len() as u128) as usize]
+fn activity_icon(revision: u64) -> &'static str {
+    const FRAMES: [&str; 4] = [".", ":", "*", "#"];
+    FRAMES[(revision as usize) % FRAMES.len()]
+}
+
+fn ascii_meter(numerator: u64, denominator: u64, width: usize) -> String {
+    let width = width.max(4);
+    if denominator == 0 {
+        return format!("[{}] n/a", ".".repeat(width));
+    }
+    let ratio = (numerator as f64 / denominator as f64).clamp(0.0, 1.0);
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    let mut bar = String::with_capacity(width);
+    for idx in 0..width {
+        bar.push(if idx < filled { '#' } else { '.' });
+    }
+    format!("[{bar}] {:>3.0}%", ratio * 100.0)
+}
+
+fn value_delta(current: u64, previous: u64) -> i64 {
+    if current >= previous {
+        (current - previous) as i64
+    } else {
+        -((previous - current) as i64)
+    }
+}
+
+fn format_signed_count(delta: i64) -> String {
+    if delta > 0 {
+        format!("+{delta}")
+    } else {
+        delta.to_string()
+    }
+}
+
+fn format_signed_millicpu(delta: i64) -> String {
+    if delta == 0 {
+        return "0m".to_string();
+    }
+    let sign = if delta > 0 { "+" } else { "-" };
+    format!("{sign}{}", format_millicpu(delta.unsigned_abs()))
+}
+
+fn format_signed_bytes(delta: i64) -> String {
+    if delta == 0 {
+        return "0B".to_string();
+    }
+    let sign = if delta > 0 { "+" } else { "-" };
+    format!("{sign}{}", format_bytes(delta.unsigned_abs()))
+}
+
+fn ratio_percent_value(numerator: u64, denominator: u64) -> Option<f64> {
+    if denominator == 0 {
+        return None;
+    }
+    Some((numerator as f64 / denominator as f64) * 100.0)
+}
+
+fn truncate_with_tilde(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let len = value.chars().count();
+    if len <= width {
+        return value.to_string();
+    }
+    if width == 1 {
+        return "~".to_string();
+    }
+    let mut out: String = value.chars().take(width.saturating_sub(1)).collect();
+    out.push('~');
+    out
+}
+
+fn fixed_width_cell(value: &str, width: usize) -> String {
+    let mut out = truncate_with_tilde(value, width);
+    let len = out.chars().count();
+    if len < width {
+        out.push_str(&" ".repeat(width - len));
+    }
+    out
+}
+
+fn format_pulse_cells(cells: &[String], columns: usize, cell_width: usize) -> String {
+    let columns = columns.max(1);
+    let mut out = String::new();
+    for idx in 0..columns {
+        if idx > 0 {
+            out.push_str("  ");
+        }
+        let value = cells.get(idx).map(String::as_str).unwrap_or("");
+        out.push_str(&fixed_width_cell(value, cell_width));
+    }
+    out
 }
 
 fn pane_icon(pane: Pane) -> &'static str {
@@ -4665,15 +5214,15 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::Utc;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
     use tokio::sync::mpsc;
 
     use super::{
         App, ColorSupport, ResourceAlias, classify_status_severity, color_support_label,
-        command_names, detect_color_support_from_env, is_auth_refresh_log_error,
-        is_retryable_log_error, is_visible_log_line, next_log_reconnect_backoff_ms,
-        parse_log_source, parse_resource_alias, resource_alias_names, search_match_lines_in_logs,
-        severity_tag, slice_chars, ui_theme_for,
+        command_names, detect_color_support_from_env, highlighted_json_text,
+        is_auth_refresh_log_error, is_retryable_log_error, is_visible_log_line,
+        json_spans_for_line, next_log_reconnect_backoff_ms, parse_log_source, parse_resource_alias,
+        resource_alias_names, search_match_lines_in_logs, severity_tag, slice_chars, ui_theme_for,
     };
     use crate::{
         cluster::{
@@ -4934,6 +5483,40 @@ mod tests {
     }
 
     #[test]
+    fn json_syntax_highlighter_marks_key_number_and_bool_tokens() {
+        let spans = json_spans_for_line(r#"  "cpu": 123, "ready": true"#, ColorSupport::Basic);
+        assert!(
+            spans
+                .iter()
+                .any(|(text, style)| text == "\"cpu\"" && style.fg == Some(Color::Cyan))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(text, style)| text == "123" && style.fg == Some(Color::Magenta))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(text, style)| text == "true" && style.fg == Some(Color::Yellow))
+        );
+    }
+
+    #[test]
+    fn json_syntax_highlighter_keeps_search_highlight() {
+        let rendered =
+            highlighted_json_text("{\n  \"name\": \"demo\"\n}", "demo", ColorSupport::Basic);
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| {
+                    span.content.contains("demo") && span.style.bg == Some(Color::Yellow)
+                }))
+        );
+    }
+
+    #[test]
     fn classifies_status_tags() {
         assert_eq!(severity_tag(classify_status_severity("Running")), "[OK]");
         assert_eq!(severity_tag(classify_status_severity("Pending")), "[!!]");
@@ -5006,7 +5589,8 @@ mod tests {
 
         let snap = render_snapshot(&mut app, 120, 32);
         assert!(snap.contains("[CTX]"));
-        assert!(snap.contains("[PULSE] Resource Pulse"));
+        assert!(snap.contains("[PULSE] Cluster Pulse"));
+        assert!(snap.contains("[LIVE]"));
         assert!(snap.contains("[OK] Running"));
         assert!(snap.contains("[!!] Pending"));
         assert!(snap.contains("pod-bad"));
