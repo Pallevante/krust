@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    io,
+    env, io,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -231,6 +231,8 @@ struct App {
     resource_provider: Arc<dyn ResourceProvider>,
     keymap: Keymap,
     readonly: bool,
+    theme: UiTheme,
+    color_support: ColorSupport,
     show_help: bool,
     detail_page_step: u16,
     pending_detail_g: bool,
@@ -284,6 +286,9 @@ struct UiTheme {
     block: Style,
     table_header: Style,
     row_highlight: Style,
+    row_ok: Style,
+    row_warn: Style,
+    row_err: Style,
     status_ok: Style,
     status_warn: Style,
     status_err: Style,
@@ -292,36 +297,149 @@ struct UiTheme {
     command_idle: Style,
 }
 
-fn ui_theme() -> UiTheme {
-    UiTheme {
-        header: Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(255, 242, 204))
-            .add_modifier(Modifier::BOLD),
-        block: Style::default().fg(Color::Rgb(238, 244, 255)),
-        table_header: Style::default()
-            .fg(Color::Rgb(255, 247, 214))
-            .add_modifier(Modifier::BOLD),
-        row_highlight: Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(186, 223, 255))
-            .add_modifier(Modifier::BOLD),
-        status_ok: Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(214, 245, 214)),
-        status_warn: Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(255, 235, 179)),
-        status_err: Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(255, 204, 204))
-            .add_modifier(Modifier::BOLD),
-        help: Style::default().fg(Color::Rgb(192, 208, 235)),
-        command_active: Style::default()
-            .fg(Color::Black)
-            .bg(Color::Rgb(229, 242, 255))
-            .add_modifier(Modifier::BOLD),
-        command_idle: Style::default().fg(Color::Rgb(161, 180, 214)),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorSupport {
+    NoColor,
+    Basic,
+    Ansi256,
+    TrueColor,
+}
+
+fn detect_color_support() -> ColorSupport {
+    detect_color_support_from_env(
+        env::var("NO_COLOR").ok().as_deref(),
+        env::var("COLORTERM").ok().as_deref(),
+        env::var("TERM").ok().as_deref(),
+    )
+}
+
+fn detect_color_support_from_env(
+    no_color: Option<&str>,
+    colorterm: Option<&str>,
+    term: Option<&str>,
+) -> ColorSupport {
+    if no_color.is_some() {
+        return ColorSupport::NoColor;
+    }
+    let colorterm = colorterm.unwrap_or("").to_ascii_lowercase();
+    if colorterm.contains("truecolor") || colorterm.contains("24bit") {
+        return ColorSupport::TrueColor;
+    }
+    let term = term.unwrap_or("").to_ascii_lowercase();
+    if term.contains("256color") {
+        return ColorSupport::Ansi256;
+    }
+    if term == "dumb" || term.is_empty() {
+        return ColorSupport::NoColor;
+    }
+    ColorSupport::Basic
+}
+
+fn ui_theme_for(support: ColorSupport) -> UiTheme {
+    match support {
+        ColorSupport::TrueColor => UiTheme {
+            header: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(255, 242, 204))
+                .add_modifier(Modifier::BOLD),
+            block: Style::default().fg(Color::Rgb(238, 244, 255)),
+            table_header: Style::default()
+                .fg(Color::Rgb(255, 247, 214))
+                .add_modifier(Modifier::BOLD),
+            row_highlight: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(186, 223, 255))
+                .add_modifier(Modifier::BOLD),
+            row_ok: Style::default().fg(Color::Rgb(219, 252, 219)),
+            row_warn: Style::default().fg(Color::Rgb(255, 233, 168)),
+            row_err: Style::default().fg(Color::Rgb(255, 184, 184)),
+            status_ok: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(214, 245, 214)),
+            status_warn: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(255, 235, 179)),
+            status_err: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(255, 204, 204))
+                .add_modifier(Modifier::BOLD),
+            help: Style::default().fg(Color::Rgb(192, 208, 235)),
+            command_active: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(229, 242, 255))
+                .add_modifier(Modifier::BOLD),
+            command_idle: Style::default().fg(Color::Rgb(161, 180, 214)),
+        },
+        ColorSupport::Ansi256 => UiTheme {
+            header: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Indexed(229))
+                .add_modifier(Modifier::BOLD),
+            block: Style::default().fg(Color::Indexed(254)),
+            table_header: Style::default()
+                .fg(Color::Indexed(230))
+                .add_modifier(Modifier::BOLD),
+            row_highlight: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Indexed(117))
+                .add_modifier(Modifier::BOLD),
+            row_ok: Style::default().fg(Color::Indexed(120)),
+            row_warn: Style::default().fg(Color::Indexed(220)),
+            row_err: Style::default().fg(Color::Indexed(210)),
+            status_ok: Style::default().fg(Color::Black).bg(Color::Indexed(120)),
+            status_warn: Style::default().fg(Color::Black).bg(Color::Indexed(220)),
+            status_err: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Indexed(210))
+                .add_modifier(Modifier::BOLD),
+            help: Style::default().fg(Color::Indexed(145)),
+            command_active: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Indexed(153))
+                .add_modifier(Modifier::BOLD),
+            command_idle: Style::default().fg(Color::Indexed(109)),
+        },
+        ColorSupport::Basic => UiTheme {
+            header: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            block: Style::default().fg(Color::White),
+            table_header: Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            row_highlight: Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            row_ok: Style::default().fg(Color::Green),
+            row_warn: Style::default().fg(Color::Yellow),
+            row_err: Style::default().fg(Color::Red),
+            status_ok: Style::default().fg(Color::Black).bg(Color::Green),
+            status_warn: Style::default().fg(Color::Black).bg(Color::Yellow),
+            status_err: Style::default().fg(Color::White).bg(Color::Red),
+            help: Style::default().fg(Color::DarkGray),
+            command_active: Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+            command_idle: Style::default().fg(Color::DarkGray),
+        },
+        ColorSupport::NoColor => UiTheme {
+            header: Style::default().add_modifier(Modifier::BOLD),
+            block: Style::default(),
+            table_header: Style::default().add_modifier(Modifier::BOLD),
+            row_highlight: Style::default().add_modifier(Modifier::REVERSED),
+            row_ok: Style::default(),
+            row_warn: Style::default().add_modifier(Modifier::DIM),
+            row_err: Style::default().add_modifier(Modifier::BOLD),
+            status_ok: Style::default(),
+            status_warn: Style::default().add_modifier(Modifier::DIM),
+            status_err: Style::default().add_modifier(Modifier::BOLD),
+            help: Style::default().add_modifier(Modifier::DIM),
+            command_active: Style::default().add_modifier(Modifier::BOLD),
+            command_idle: Style::default().add_modifier(Modifier::DIM),
+        },
     }
 }
 
@@ -1310,6 +1428,7 @@ impl App {
             .iter()
             .position(|tab| tab.context == initial_context)
             .unwrap_or(0);
+        let color_support = detect_color_support();
 
         Self {
             store: StateStore::default(),
@@ -1331,6 +1450,8 @@ impl App {
             resource_provider,
             keymap,
             readonly,
+            theme: ui_theme_for(color_support),
+            color_support,
             show_help,
             detail_page_step: 10,
             pending_detail_g: false,
@@ -2740,7 +2861,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
-        let theme = ui_theme();
+        let theme = self.theme;
         let active = self.current_tab().clone();
         let active_tab_idx = self.active_tab;
         let request = self.view_request_for_tab(&active);
@@ -2766,7 +2887,7 @@ impl App {
         let hb = heartbeat_icon();
         let ctx_short = compact_context_name(&active.context);
         let mut top_line = format!(
-            "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
+            "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [CLR] {}  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
             hb,
             now,
             ctx_short,
@@ -2776,6 +2897,7 @@ impl App {
             active.kind().short_name(),
             pane_label,
             pane_icon(active.pane),
+            color_support_label(self.color_support),
             visible_rows,
             visible_rows,
             self.store.entity_count(),
@@ -3121,13 +3243,16 @@ impl App {
                         .rows
                         .iter()
                         .map(|row| {
+                            let sev = classify_status_severity(&row.status);
+                            let status = format!("{} {}", severity_tag(sev), row.status);
                             Row::new(vec![
                                 Cell::from(row.namespace.clone()),
                                 Cell::from(row.name.clone()),
-                                Cell::from(row.status.clone()),
+                                Cell::from(status),
                                 Cell::from(row.age.clone()),
                                 Cell::from(row.summary.clone()),
                             ])
+                            .style(severity_style(&theme, sev))
                         })
                         .collect();
 
@@ -4027,6 +4152,64 @@ fn health_icon(failed: usize, pending: usize) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Severity {
+    Ok,
+    Warn,
+    Err,
+}
+
+fn classify_status_severity(status: &str) -> Severity {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("error")
+        || lower.contains("fail")
+        || lower.contains("crash")
+        || lower.contains("oom")
+        || lower.contains("forbidden")
+        || lower.contains("denied")
+        || lower.contains("blocked")
+        || lower.contains("evicted")
+        || lower.contains("terminated")
+    {
+        return Severity::Err;
+    }
+    if lower.contains("pending")
+        || lower.contains("unknown")
+        || lower.contains("waiting")
+        || lower.contains("init")
+        || lower.contains("terminating")
+        || lower.contains("notready")
+    {
+        return Severity::Warn;
+    }
+    Severity::Ok
+}
+
+fn severity_tag(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Ok => "[OK]",
+        Severity::Warn => "[!!]",
+        Severity::Err => "[XX]",
+    }
+}
+
+fn severity_style(theme: &UiTheme, severity: Severity) -> Style {
+    match severity {
+        Severity::Ok => theme.row_ok,
+        Severity::Warn => theme.row_warn,
+        Severity::Err => theme.row_err,
+    }
+}
+
+fn color_support_label(support: ColorSupport) -> &'static str {
+    match support {
+        ColorSupport::NoColor => "mono",
+        ColorSupport::Basic => "basic",
+        ColorSupport::Ansi256 => "256",
+        ColorSupport::TrueColor => "truecolor",
+    }
+}
+
 fn status_style_for_line(theme: &UiTheme, status: &str) -> Style {
     let lower = status.to_ascii_lowercase();
     if lower.contains("error")
@@ -4476,15 +4659,121 @@ fn parse_resource_alias(token: &str) -> ResourceAlias {
 mod tests {
     use std::{
         collections::{HashSet, VecDeque},
+        sync::Arc,
         time::Instant,
     };
 
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use ratatui::{Terminal, backend::TestBackend};
+    use tokio::sync::mpsc;
+
     use super::{
-        ResourceAlias, command_names, is_auth_refresh_log_error, is_retryable_log_error,
-        is_visible_log_line, next_log_reconnect_backoff_ms, parse_log_source, parse_resource_alias,
-        resource_alias_names, search_match_lines_in_logs, slice_chars,
+        App, ColorSupport, ResourceAlias, classify_status_severity, color_support_label,
+        command_names, detect_color_support_from_env, is_auth_refresh_log_error,
+        is_retryable_log_error, is_visible_log_line, next_log_reconnect_backoff_ms,
+        parse_log_source, parse_resource_alias, resource_alias_names, search_match_lines_in_logs,
+        severity_tag, slice_chars, ui_theme_for,
     };
-    use crate::model::ResourceKind;
+    use crate::{
+        cluster::{
+            ActionError, ActionExecutor, ActionResult, PodLogRequest, PodLogStream,
+            ResourceProvider, WatchTarget,
+        },
+        keymap::Keymap,
+        model::{Pane, ResourceEntity, ResourceKey, ResourceKind, StateDelta},
+    };
+
+    struct NoopProvider {
+        contexts: Vec<String>,
+    }
+
+    #[async_trait]
+    impl ResourceProvider for NoopProvider {
+        fn context_names(&self) -> &[String] {
+            &self.contexts
+        }
+
+        fn default_context(&self) -> Option<&str> {
+            self.contexts.first().map(String::as_str)
+        }
+
+        async fn start(&self, _tx: mpsc::Sender<StateDelta>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn replace_watch_plan(
+            &self,
+            _context: &str,
+            _targets: &[WatchTarget],
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stream_pod_logs(&self, _request: PodLogRequest) -> anyhow::Result<PodLogStream> {
+            anyhow::bail!("noop log stream provider")
+        }
+    }
+
+    struct NoopExecutor;
+
+    #[async_trait]
+    impl ActionExecutor for NoopExecutor {
+        async fn delete_resource(&self, _key: &ResourceKey) -> Result<ActionResult, ActionError> {
+            Err(ActionError::Unsupported("noop".to_string()))
+        }
+    }
+
+    fn mk_entity(
+        context: &str,
+        kind: ResourceKind,
+        namespace: Option<&str>,
+        name: &str,
+        status: &str,
+    ) -> ResourceEntity {
+        ResourceEntity {
+            key: ResourceKey::new(context, kind, namespace.map(str::to_string), name),
+            status: status.to_string(),
+            age: Some(Utc::now()),
+            labels: vec![("app".to_string(), "demo".to_string())],
+            summary: "snapshot".to_string(),
+            raw: serde_json::json!({
+                "metadata": { "name": name, "namespace": namespace.unwrap_or("default") },
+                "status": { "phase": status }
+            }),
+        }
+    }
+
+    fn test_app() -> App {
+        let contexts = vec!["ctx-dev".to_string()];
+        App::new(
+            contexts,
+            "ctx-dev".to_string(),
+            Some("default".to_string()),
+            Arc::new(NoopExecutor),
+            Arc::new(NoopProvider {
+                contexts: vec!["ctx-dev".to_string()],
+            }),
+            Keymap::default(),
+            false,
+            true,
+        )
+    }
+
+    fn render_snapshot(app: &mut App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let frame = terminal.draw(|f| app.draw(f)).expect("draw");
+        let mut out = Vec::new();
+        for y in 0..frame.area.height {
+            let mut line = String::new();
+            for x in 0..frame.area.width {
+                line.push_str(frame.buffer[(x, y)].symbol());
+            }
+            out.push(line.trim_end().to_string());
+        }
+        out.join("\n")
+    }
 
     #[test]
     fn parses_supported_k9s_aliases() {
@@ -4642,6 +4931,126 @@ mod tests {
         assert!(!is_visible_log_line("[ns-a/pod-a/c1] hidden", &hidden));
         assert!(is_visible_log_line("[ns-b/pod-b/c1] visible", &hidden));
         assert!(is_visible_log_line("no prefix line", &hidden));
+    }
+
+    #[test]
+    fn classifies_status_tags() {
+        assert_eq!(severity_tag(classify_status_severity("Running")), "[OK]");
+        assert_eq!(severity_tag(classify_status_severity("Pending")), "[!!]");
+        assert_eq!(
+            severity_tag(classify_status_severity("CrashLoopBackOff")),
+            "[XX]"
+        );
+    }
+
+    #[test]
+    fn detects_color_capability_levels() {
+        assert_eq!(
+            detect_color_support_from_env(None, Some("truecolor"), Some("xterm-256color")),
+            ColorSupport::TrueColor
+        );
+        assert_eq!(
+            detect_color_support_from_env(None, None, Some("xterm-256color")),
+            ColorSupport::Ansi256
+        );
+        assert_eq!(
+            detect_color_support_from_env(None, None, Some("xterm")),
+            ColorSupport::Basic
+        );
+        assert_eq!(
+            detect_color_support_from_env(Some("1"), Some("truecolor"), Some("xterm")),
+            ColorSupport::NoColor
+        );
+    }
+
+    #[test]
+    fn color_labels_are_stable_for_ui_snapshot_headers() {
+        assert_eq!(color_support_label(ColorSupport::NoColor), "mono");
+        assert_eq!(color_support_label(ColorSupport::Basic), "basic");
+        assert_eq!(color_support_label(ColorSupport::Ansi256), "256");
+        assert_eq!(color_support_label(ColorSupport::TrueColor), "truecolor");
+    }
+
+    #[test]
+    fn builds_theme_for_all_color_support_levels() {
+        let _ = ui_theme_for(ColorSupport::NoColor);
+        let _ = ui_theme_for(ColorSupport::Basic);
+        let _ = ui_theme_for(ColorSupport::Ansi256);
+        let _ = ui_theme_for(ColorSupport::TrueColor);
+    }
+
+    #[test]
+    fn snapshot_table_pane_has_light_icons_and_status_tags() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-ok",
+            "Running",
+        )));
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-warn",
+            "Pending",
+        )));
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-bad",
+            "CrashLoopBackOff",
+        )));
+
+        let snap = render_snapshot(&mut app, 120, 32);
+        assert!(snap.contains("[CTX]"));
+        assert!(snap.contains("[PULSE] Resource Pulse"));
+        assert!(snap.contains("[OK] Running"));
+        assert!(snap.contains("[!!] Pending"));
+        assert!(snap.contains("pod-bad"));
+        assert!(snap.contains("[XX]"));
+    }
+
+    #[test]
+    fn snapshot_describe_pane_has_viewer_state_line() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        )));
+        app.current_tab_mut().pane = Pane::Describe;
+        app.current_tab_mut().detail_filter = "metadata".to_string();
+
+        let snap = render_snapshot(&mut app, 120, 32);
+        assert!(snap.contains("Describe | NORMAL"));
+        assert!(snap.contains("search:/metadata"));
+    }
+
+    #[test]
+    fn snapshot_logs_pane_has_state_and_icons() {
+        let mut app = test_app();
+        app.current_tab_mut().pane = Pane::Logs;
+        app.logs.selection = Some(super::LogSelection {
+            scope: "pod default/pod-a".to_string(),
+            targets: vec![super::LogTarget {
+                context: "ctx-dev".to_string(),
+                namespace: "default".to_string(),
+                pod: "pod-a".to_string(),
+                container: Some("main".to_string()),
+            }],
+        });
+        app.push_log_line("[default/pod-a/main] line-1".to_string());
+        app.push_log_line("[default/pod-a/main] line-2".to_string());
+
+        let snap = render_snapshot(&mut app, 120, 32);
+        assert!(snap.contains("[LG]"));
+        assert!(snap.contains("Logs | target:pod default/pod-a"));
+        assert!(snap.contains("[default/pod-a/main] line-1"));
     }
 
     #[test]
