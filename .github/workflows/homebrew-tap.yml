@@ -1,9 +1,6 @@
-name: Homebrew Tap Sync
+name: Krust / Homebrew Tap
 
 on:
-  release:
-    types:
-      - published
   workflow_dispatch:
     inputs:
       tag:

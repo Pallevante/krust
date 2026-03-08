@@ -118,6 +118,8 @@ On each push to `main`, the `Release` workflow will:
 - bump package version in `Cargo.toml`
 - create and push the release tag
 - build and upload release artifacts
+- verify required release assets are present on GitHub Releases
+- sync latest formula to Homebrew tap (`ErfanY/homebrew-krust`)
 - update `docs/status.md`
 
 Manual publish override:

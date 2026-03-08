@@ -1,12 +1,9 @@
-name: Release
+name: Krust / Release
 
 on:
   push:
     branches:
       - main
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   workflow_dispatch:
     inputs:
       version:
@@ -22,9 +19,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  preflight:
+    name: Preflight release eligibility
+    runs-on: ubuntu-latest
+    outputs:
+      release_enabled: ${{ steps.eval.outputs.release_enabled }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Evaluate docs-only change set
+        id: eval
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "release_enabled=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          if [[ -z "${BEFORE}" || "${BEFORE}" == "0000000000000000000000000000000000000000" ]]; then
+            BEFORE="$(git rev-parse "${AFTER}^" 2>/dev/null || true)"
+          fi
+
+          CHANGED="$(git diff --name-only "${BEFORE}" "${AFTER}" || true)"
+          echo "Changed files:"
+          echo "${CHANGED}"
+
+          NON_DOC="$(echo "${CHANGED}" | grep -Ev '^(docs/|.*\.md$)' || true)"
+          if [[ -z "${NON_DOC}" ]]; then
+            echo "Docs-only change set detected; release disabled."
+            echo "release_enabled=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Non-doc changes detected; release enabled."
+            echo "release_enabled=true" >> "${GITHUB_OUTPUT}"
+          fi
+
   prepare:
     name: Validate + compute version
-    if: ${{ github.event_name != 'push' || (!contains(github.event.head_commit.message, '[skip ci]') && github.actor != 'github-actions[bot]') }}
+    needs: preflight
+    if: ${{ needs.preflight.outputs.release_enabled == 'true' && (github.event_name != 'push' || (!contains(github.event.head_commit.message, '[skip ci]') && github.actor != 'github-actions[bot]')) }}
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
@@ -120,7 +160,6 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Update Cargo version on main
-        if: ${{ github.event_name == 'push' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -278,9 +317,104 @@ jobs:
             dist/SHA256SUMS
             dist/krust.rb
 
+  verify-release-assets:
+    name: Verify release assets
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify required assets exist on release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSETS="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name')"
+          echo "Release assets:"
+          echo "${ASSETS}"
+
+          required=(
+            "krust-x86_64-unknown-linux-gnu.tar.gz"
+            "krust-x86_64-apple-darwin.tar.gz"
+            "krust-aarch64-apple-darwin.tar.gz"
+            "SHA256SUMS"
+            "krust.rb"
+          )
+
+          for item in "${required[@]}"; do
+            if ! grep -Fxq "${item}" <<<"${ASSETS}"; then
+              echo "Missing release asset: ${item}" >&2
+              exit 1
+            fi
+          done
+
+  sync-homebrew-tap:
+    name: Sync Homebrew tap
+    needs: [prepare, publish, verify-release-assets]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.prepare.outputs.tag }}
+
+      - name: Download SHA256SUMS from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "SHA256SUMS" \
+            --dir dist
+
+      - name: Generate formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/generate_homebrew_formula.sh \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --checksums dist/SHA256SUMS \
+            --output dist/krust.rb
+
+      - name: Push formula to tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          TAP_REPO: ErfanY/homebrew-krust
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN}" ]]; then
+            echo "Missing HOMEBREW_TAP_GITHUB_TOKEN secret" >&2
+            exit 1
+          fi
+
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp dist/krust.rb tap/Formula/krust.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- Formula/krust.rb; then
+            echo "No tap update required"
+            exit 0
+          fi
+
+          git add Formula/krust.rb
+          git commit -m "krust ${VERSION}"
+          git push
+
   update-status:
     name: Update status page
-    needs: [prepare, publish]
+    needs: [prepare, publish, verify-release-assets, sync-homebrew-tap]
     runs-on: ubuntu-latest
 
     steps:
