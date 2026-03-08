@@ -4,6 +4,7 @@
 [![Release](https://github.com/ErfanY/krust/actions/workflows/release.yml/badge.svg)](https://github.com/ErfanY/krust/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Kubernetes 1.33+](https://img.shields.io/badge/Kubernetes-1.33%2B-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
+[Release Status](docs/status.md)
 
 `krust` is a latency-first Kubernetes terminal navigator for operators who work across many clusters and large resource sets.
 
@@ -102,6 +103,32 @@ Binary path:
 ```bash
 target/release/krust
 ```
+
+### Publish a GitHub release
+
+Main-branch publish (default):
+
+```bash
+git push origin main
+```
+
+On each push to `main`, the `Release` workflow will:
+- run validation (`fmt`, `check`, `test`, `build`)
+- compute the next semver (`major` on `BREAKING CHANGE`/`!`, `minor` on `feat:`, otherwise `patch`)
+- bump package version in `Cargo.toml`
+- create and push the release tag
+- build and upload release artifacts
+- update `docs/status.md`
+
+Manual publish override:
+
+- Run Actions workflow `Release`
+- Provide `version` (`0.1.0` or `v0.1.0`)
+
+The workflow builds platform artifacts, publishes a GitHub Release, uploads:
+- `krust-*.tar.gz`
+- `SHA256SUMS`
+- `krust.rb`
 
 ### Run
 
