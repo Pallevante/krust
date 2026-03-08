@@ -300,7 +300,8 @@ mod tests {
             "data": { "old": "b2xk" },
             "stringData": { "tmp": "do-not-keep" }
         });
-        let edited = "username: admin\npassword: s3cr3t\nenabled: true\nretries: 3\nnested:\n  a: 1\n";
+        let edited =
+            "username: admin\npassword: s3cr3t\nenabled: true\nretries: 3\nnested:\n  a: 1\n";
 
         let updated = apply_decoded_secret_yaml(&original, edited).expect("yaml apply succeeds");
 

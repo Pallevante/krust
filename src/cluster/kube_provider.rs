@@ -969,19 +969,18 @@ mod tests {
 
     use super::{
         ActionError, KubeResourceProvider, api_resource_spec_for_kind, is_forbidden_watcher_error,
-        next_watch_backoff,
-        select_warm_contexts,
+        next_watch_backoff, select_warm_contexts,
     };
     use crate::{
         cluster::ActionExecutor,
         model::{ResourceKey, ResourceKind},
     };
     use kube::config::Kubeconfig;
-    use tokio::sync::Mutex;
     use std::{
         collections::HashMap,
         time::{Duration, Instant},
     };
+    use tokio::sync::Mutex;
 
     #[test]
     fn select_warm_contexts_respects_limit_and_ttl() {
@@ -1131,7 +1130,12 @@ mod tests {
     #[tokio::test]
     async fn delete_resource_is_blocked_in_readonly_mode() {
         let provider = readonly_provider();
-        let key = ResourceKey::new("ctx", ResourceKind::Pods, Some("default".to_string()), "demo");
+        let key = ResourceKey::new(
+            "ctx",
+            ResourceKind::Pods,
+            Some("default".to_string()),
+            "demo",
+        );
         let err = provider
             .delete_resource(&key)
             .await
@@ -1142,7 +1146,12 @@ mod tests {
     #[tokio::test]
     async fn replace_resource_is_blocked_in_readonly_mode() {
         let provider = readonly_provider();
-        let key = ResourceKey::new("ctx", ResourceKind::Pods, Some("default".to_string()), "demo");
+        let key = ResourceKey::new(
+            "ctx",
+            ResourceKind::Pods,
+            Some("default".to_string()),
+            "demo",
+        );
         let err = provider
             .replace_resource(&key, serde_json::json!({}))
             .await

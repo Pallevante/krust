@@ -13,10 +13,14 @@ fn build_edited_manifest(
         (Pane::Describe, DetailFormat::Json) => {
             parse_json_to_json(edited_text).map_err(|err| format!("Invalid JSON: {err}"))
         }
-        (Pane::SecretDecode, DetailFormat::Yaml) => apply_decoded_secret_yaml(original, edited_text)
-            .map_err(|err| format!("Invalid decoded secret YAML: {err}")),
-        (Pane::SecretDecode, DetailFormat::Json) => apply_decoded_secret_json(original, edited_text)
-            .map_err(|err| format!("Invalid decoded secret JSON: {err}")),
+        (Pane::SecretDecode, DetailFormat::Yaml) => {
+            apply_decoded_secret_yaml(original, edited_text)
+                .map_err(|err| format!("Invalid decoded secret YAML: {err}"))
+        }
+        (Pane::SecretDecode, DetailFormat::Json) => {
+            apply_decoded_secret_json(original, edited_text)
+                .map_err(|err| format!("Invalid decoded secret JSON: {err}"))
+        }
         _ => Err("Edit is available in Describe/Decode panes".to_string()),
     }
 }
@@ -322,10 +326,8 @@ mod tests {
     fn build_manifest_from_describe_yaml() {
         let original = json!({});
         let edited = "metadata:\n  name: demo\nspec:\n  replicas: 2\n";
-        let out =
-            build_edited_manifest(Pane::Describe, DetailFormat::Yaml, &original, edited).expect(
-                "yaml describe parse succeeds",
-            );
+        let out = build_edited_manifest(Pane::Describe, DetailFormat::Yaml, &original, edited)
+            .expect("yaml describe parse succeeds");
         assert_eq!(out["metadata"]["name"], "demo");
         assert_eq!(out["spec"]["replicas"], 2);
     }
