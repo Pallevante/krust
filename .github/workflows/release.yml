@@ -186,11 +186,15 @@ jobs:
           ' Cargo.toml > Cargo.toml.tmp
           mv Cargo.toml.tmp Cargo.toml
 
+          # Keep Cargo.lock in sync with the bumped package version so downstream
+          # --locked builds do not fail.
+          cargo generate-lockfile --offline || cargo generate-lockfile
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml
+          git add Cargo.toml Cargo.lock
           if git diff --cached --quiet; then
-            echo "No Cargo.toml changes to commit"
+            echo "No Cargo manifest/lock changes to commit"
             exit 0
           fi
           git commit -m "chore(release): v${VERSION} [skip ci]"
