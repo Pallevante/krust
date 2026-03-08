@@ -1,5 +1,26 @@
 use super::*;
 
+fn build_edited_manifest(
+    pane: Pane,
+    detail_format: DetailFormat,
+    original: &serde_json::Value,
+    edited_text: &str,
+) -> Result<serde_json::Value, String> {
+    match (pane, detail_format) {
+        (Pane::Describe, DetailFormat::Yaml) => {
+            parse_yaml_to_json(edited_text).map_err(|err| format!("Invalid YAML: {err}"))
+        }
+        (Pane::Describe, DetailFormat::Json) => {
+            parse_json_to_json(edited_text).map_err(|err| format!("Invalid JSON: {err}"))
+        }
+        (Pane::SecretDecode, DetailFormat::Yaml) => apply_decoded_secret_yaml(original, edited_text)
+            .map_err(|err| format!("Invalid decoded secret YAML: {err}")),
+        (Pane::SecretDecode, DetailFormat::Json) => apply_decoded_secret_json(original, edited_text)
+            .map_err(|err| format!("Invalid decoded secret JSON: {err}")),
+        _ => Err("Edit is available in Describe/Decode panes".to_string()),
+    }
+}
+
 impl App {
     pub(super) fn in_detail_pane(&self) -> bool {
         self.current_tab().pane != Pane::Table
@@ -263,40 +284,12 @@ impl App {
             return;
         }
 
-        let manifest = match (pane, detail_format) {
-            (Pane::Describe, DetailFormat::Yaml) => match parse_yaml_to_json(&edited_text) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    self.status_line = format!("Invalid YAML: {err}");
-                    return;
-                }
-            },
-            (Pane::Describe, DetailFormat::Json) => match parse_json_to_json(&edited_text) {
-                Ok(manifest) => manifest,
-                Err(err) => {
-                    self.status_line = format!("Invalid JSON: {err}");
-                    return;
-                }
-            },
-            (Pane::SecretDecode, DetailFormat::Yaml) => {
-                match apply_decoded_secret_yaml(&original, &edited_text) {
-                    Ok(manifest) => manifest,
-                    Err(err) => {
-                        self.status_line = format!("Invalid decoded secret YAML: {err}");
-                        return;
-                    }
-                }
+        let manifest = match build_edited_manifest(pane, detail_format, &original, &edited_text) {
+            Ok(manifest) => manifest,
+            Err(err) => {
+                self.status_line = err;
+                return;
             }
-            (Pane::SecretDecode, DetailFormat::Json) => {
-                match apply_decoded_secret_json(&original, &edited_text) {
-                    Ok(manifest) => manifest,
-                    Err(err) => {
-                        self.status_line = format!("Invalid decoded secret JSON: {err}");
-                        return;
-                    }
-                }
-            }
-            _ => unreachable!(),
         };
 
         let result = self.action_executor.replace_resource(&key, manifest).await;
@@ -304,5 +297,77 @@ impl App {
             Ok(outcome) => outcome.message,
             Err(error) => render_action_error(error, &key),
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{DetailFormat, Pane, build_edited_manifest};
+    use crate::ui::detail::base64_decode;
+
+    fn decode_data_field(value: &serde_json::Value, key: &str) -> String {
+        let encoded = value
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|obj| obj.get(key))
+            .and_then(serde_json::Value::as_str)
+            .expect("encoded key exists");
+        let bytes = base64_decode(encoded).expect("valid base64");
+        String::from_utf8(bytes).expect("utf8 payload")
+    }
+
+    #[test]
+    fn build_manifest_from_describe_yaml() {
+        let original = json!({});
+        let edited = "metadata:\n  name: demo\nspec:\n  replicas: 2\n";
+        let out =
+            build_edited_manifest(Pane::Describe, DetailFormat::Yaml, &original, edited).expect(
+                "yaml describe parse succeeds",
+            );
+        assert_eq!(out["metadata"]["name"], "demo");
+        assert_eq!(out["spec"]["replicas"], 2);
+    }
+
+    #[test]
+    fn build_manifest_from_describe_json_reports_parse_error() {
+        let original = json!({});
+        let err = build_edited_manifest(Pane::Describe, DetailFormat::Json, &original, "{ nope }")
+            .expect_err("invalid json");
+        assert!(err.starts_with("Invalid JSON:"));
+    }
+
+    #[test]
+    fn build_manifest_from_secret_decode_yaml_reencodes_values() {
+        let original = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "demo" },
+            "data": { "old": "b2xk" },
+            "stringData": { "tmp": "remove" }
+        });
+        let edited = "username: admin\nenabled: true\n";
+        let out = build_edited_manifest(Pane::SecretDecode, DetailFormat::Yaml, &original, edited)
+            .expect("secret decode yaml apply");
+        assert_eq!(decode_data_field(&out, "username"), "admin");
+        assert_eq!(decode_data_field(&out, "enabled"), "true");
+        assert!(out.get("stringData").is_none());
+    }
+
+    #[test]
+    fn build_manifest_from_secret_decode_json_reports_type_error() {
+        let original = json!({ "kind": "Secret", "data": {} });
+        let err = build_edited_manifest(Pane::SecretDecode, DetailFormat::Json, &original, "[]")
+            .expect_err("invalid decode json");
+        assert!(err.starts_with("Invalid decoded secret JSON:"));
+    }
+
+    #[test]
+    fn build_manifest_from_unsupported_pane_is_rejected() {
+        let original = json!({});
+        let err = build_edited_manifest(Pane::Table, DetailFormat::Yaml, &original, "a: b")
+            .expect_err("table pane cannot be edited");
+        assert_eq!(err, "Edit is available in Describe/Decode panes");
     }
 }

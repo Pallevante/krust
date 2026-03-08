@@ -270,3 +270,108 @@ pub(crate) fn apply_decoded_secret_json(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        apply_decoded_secret_json, apply_decoded_secret_yaml, base64_decode, parse_json_to_json,
+        parse_yaml_to_json,
+    };
+
+    fn decode_data_field(value: &serde_json::Value, key: &str) -> String {
+        let encoded = value
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|obj| obj.get(key))
+            .and_then(serde_json::Value::as_str)
+            .expect("encoded key exists");
+        let bytes = base64_decode(encoded).expect("valid base64");
+        String::from_utf8(bytes).expect("utf8 payload")
+    }
+
+    #[test]
+    fn apply_decoded_secret_yaml_reencodes_and_removes_string_data() {
+        let original = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "demo", "namespace": "default" },
+            "data": { "old": "b2xk" },
+            "stringData": { "tmp": "do-not-keep" }
+        });
+        let edited = "username: admin\npassword: s3cr3t\nenabled: true\nretries: 3\nnested:\n  a: 1\n";
+
+        let updated = apply_decoded_secret_yaml(&original, edited).expect("yaml apply succeeds");
+
+        assert_eq!(decode_data_field(&updated, "username"), "admin");
+        assert_eq!(decode_data_field(&updated, "password"), "s3cr3t");
+        assert_eq!(decode_data_field(&updated, "enabled"), "true");
+        assert_eq!(decode_data_field(&updated, "retries"), "3");
+        assert_eq!(decode_data_field(&updated, "nested"), "a: 1");
+        assert!(updated.get("stringData").is_none());
+        assert_eq!(updated["metadata"]["name"], "demo");
+    }
+
+    #[test]
+    fn apply_decoded_secret_json_reencodes_composite_values() {
+        let original = json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": "demo", "namespace": "default" },
+            "data": { "old": "b2xk" }
+        });
+        let edited = r#"{
+  "username": "admin",
+  "meta": { "enabled": true, "retries": 3 },
+  "list": [1, 2, 3],
+  "none": null
+}"#;
+
+        let updated = apply_decoded_secret_json(&original, edited).expect("json apply succeeds");
+
+        assert_eq!(decode_data_field(&updated, "username"), "admin");
+        assert_eq!(
+            decode_data_field(&updated, "meta"),
+            "{\n  \"enabled\": true,\n  \"retries\": 3\n}"
+        );
+        assert_eq!(decode_data_field(&updated, "list"), "[\n  1,\n  2,\n  3\n]");
+        assert_eq!(decode_data_field(&updated, "none"), "");
+    }
+
+    #[test]
+    fn apply_decoded_secret_yaml_rejects_non_mapping() {
+        let original = json!({ "kind": "Secret", "data": {} });
+        let err = apply_decoded_secret_yaml(&original, "- one\n- two\n").expect_err("reject list");
+        assert!(err.contains("YAML mapping"));
+    }
+
+    #[test]
+    fn apply_decoded_secret_json_rejects_non_object() {
+        let original = json!({ "kind": "Secret", "data": {} });
+        let err = apply_decoded_secret_json(&original, "[1,2,3]").expect_err("reject array");
+        assert!(err.contains("JSON object"));
+    }
+
+    #[test]
+    fn apply_decoded_secret_yaml_rejects_non_object_manifest() {
+        let original = json!("not-an-object");
+        let err =
+            apply_decoded_secret_yaml(&original, "username: admin\n").expect_err("reject scalar");
+        assert!(err.contains("not an object"));
+    }
+
+    #[test]
+    fn apply_decoded_secret_json_rejects_non_object_manifest() {
+        let original = json!(["not", "an", "object"]);
+        let err = apply_decoded_secret_json(&original, r#"{"username":"admin"}"#)
+            .expect_err("reject array manifest");
+        assert!(err.contains("not an object"));
+    }
+
+    #[test]
+    fn parse_text_helpers_reject_invalid_payloads() {
+        assert!(parse_yaml_to_json(":\n-").is_err());
+        assert!(parse_json_to_json("{ nope }").is_err());
+    }
+}

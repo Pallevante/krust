@@ -967,7 +967,17 @@ mod tests {
     use kube::{Error, error::Status};
     use kube_runtime::watcher;
 
-    use super::{is_forbidden_watcher_error, next_watch_backoff, select_warm_contexts};
+    use super::{
+        ActionError, KubeResourceProvider, api_resource_spec_for_kind, is_forbidden_watcher_error,
+        next_watch_backoff,
+        select_warm_contexts,
+    };
+    use crate::{
+        cluster::ActionExecutor,
+        model::{ResourceKey, ResourceKind},
+    };
+    use kube::config::Kubeconfig;
+    use tokio::sync::Mutex;
     use std::{
         collections::HashMap,
         time::{Duration, Instant},
@@ -1077,5 +1087,66 @@ mod tests {
             current = next_watch_backoff(current, Duration::from_secs(1));
         }
         assert_eq!(current, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn api_resource_spec_exists_for_all_supported_kinds() {
+        for kind in ResourceKind::ORDERED {
+            assert!(
+                api_resource_spec_for_kind(kind).is_some(),
+                "missing api resource spec for {:?}",
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn api_resource_spec_namespaced_flag_matches_kind_contract() {
+        for kind in ResourceKind::ORDERED {
+            let spec = api_resource_spec_for_kind(kind).expect("spec exists");
+            assert_eq!(
+                spec.namespaced,
+                kind.is_namespaced(),
+                "namespaced mismatch for {:?}",
+                kind
+            );
+        }
+    }
+
+    fn readonly_provider() -> KubeResourceProvider {
+        KubeResourceProvider {
+            contexts: vec!["ctx".to_string()],
+            default_context: Some("ctx".to_string()),
+            kubeconfig: Kubeconfig::default(),
+            readonly: true,
+            warm_contexts: 1,
+            warm_context_ttl: Duration::from_secs(30),
+            clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            watched: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            context_last_active: std::sync::Arc::new(Mutex::new(HashMap::new())),
+            delta_tx: std::sync::Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_resource_is_blocked_in_readonly_mode() {
+        let provider = readonly_provider();
+        let key = ResourceKey::new("ctx", ResourceKind::Pods, Some("default".to_string()), "demo");
+        let err = provider
+            .delete_resource(&key)
+            .await
+            .expect_err("readonly delete must fail");
+        assert!(matches!(err, ActionError::ReadOnly));
+    }
+
+    #[tokio::test]
+    async fn replace_resource_is_blocked_in_readonly_mode() {
+        let provider = readonly_provider();
+        let key = ResourceKey::new("ctx", ResourceKind::Pods, Some("default".to_string()), "demo");
+        let err = provider
+            .replace_resource(&key, serde_json::json!({}))
+            .await
+            .expect_err("readonly replace must fail");
+        assert!(matches!(err, ActionError::ReadOnly));
     }
 }
