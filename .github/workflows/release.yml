@@ -432,25 +432,23 @@ jobs:
           SHA="${{ needs.prepare.outputs.release_sha }}"
           DATE_UTC="$(date -u +"%Y-%m-%d %H:%M:%SZ")"
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
-
-          cat > docs/status.md <<STATUS
-# Release Status
-
-- Latest release: \`${TAG}\`
-- SemVer: \`${VERSION}\`
-- Source commit: \`${SHA}\`
-- Published at (UTC): \`${DATE_UTC}\`
-- Release page: [${RELEASE_URL}](${RELEASE_URL})
-- Pipeline run: [${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
-
-## Artifacts
-
-- \`krust-x86_64-unknown-linux-gnu.tar.gz\`
-- \`krust-x86_64-apple-darwin.tar.gz\`
-- \`krust-aarch64-apple-darwin.tar.gz\`
-- \`SHA256SUMS\`
-- \`krust.rb\`
-STATUS
+          {
+            printf '# Release Status\n\n'
+            printf -- '- Latest release: `%s`\n' "${TAG}"
+            printf -- '- SemVer: `%s`\n' "${VERSION}"
+            printf -- '- Source commit: `%s`\n' "${SHA}"
+            printf -- '- Published at (UTC): `%s`\n' "${DATE_UTC}"
+            printf -- '- Release page: [%s](%s)\n' "${RELEASE_URL}" "${RELEASE_URL}"
+            printf -- '- Pipeline run: [%s](%s)\n\n' \
+              "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            printf '## Artifacts\n\n'
+            printf -- '- `%s`\n' "krust-x86_64-unknown-linux-gnu.tar.gz"
+            printf -- '- `%s`\n' "krust-x86_64-apple-darwin.tar.gz"
+            printf -- '- `%s`\n' "krust-aarch64-apple-darwin.tar.gz"
+            printf -- '- `%s`\n' "SHA256SUMS"
+            printf -- '- `%s`\n' "krust.rb"
+          } > docs/status.md
 
       - name: Commit status page
         shell: bash
